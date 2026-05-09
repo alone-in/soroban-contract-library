@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "contracts/escrow",
+    "contracts/vesting",
+    "contracts/multisig",
+    "contracts/dao_voting",
+]
+
+[workspace.dependencies]
+soroban-sdk = { version = "21.0.0", features = ["testutils"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"
+codegen-units = 1
