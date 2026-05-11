@@ -169,7 +169,7 @@ mod tests {
     fn setup() -> (Env, VestingContractClient<'static>, Address, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
-        let id = env.register(VestingContract, ());
+        let id = env.register_contract(None, VestingContract);
         let client = VestingContractClient::new(&env, &id);
 
         let funder = Address::generate(&env);
@@ -225,5 +225,92 @@ mod tests {
         let sid = client.create_schedule(&funder, &beneficiary, &token, &1000, &0, &50, &100, &VestingType::Linear, &false);
         env.ledger().with_mut(|l| l.sequence_number = 10);
         client.claim(&beneficiary, &sid);
+    }
+
+    #[test]
+    fn test_linear_vested_amount_at_end_ledger() {
+        let (env, client, funder, beneficiary, token) = setup();
+        // Verifies exact end-ledger math returns the full scheduled amount.
+        let sid = client.create_schedule(&funder, &beneficiary, &token, &1000, &0, &0, &100, &VestingType::Linear, &false);
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+        assert_eq!(client.vested_amount(&sid), 1000);
+    }
+
+    #[test]
+    fn test_linear_vested_amount_past_end_ledger() {
+        let (env, client, funder, beneficiary, token) = setup();
+        // Verifies vesting caps at total_amount after the schedule has ended.
+        let sid = client.create_schedule(&funder, &beneficiary, &token, &1000, &0, &0, &100, &VestingType::Linear, &false);
+        env.ledger().with_mut(|l| l.sequence_number = 150);
+        assert_eq!(client.vested_amount(&sid), 1000);
+    }
+
+    #[test]
+    #[should_panic(expected = "nothing to claim")]
+    fn test_claim_twice_same_ledger_panics() {
+        let (env, client, funder, beneficiary, token) = setup();
+        // Verifies claimed accounting prevents claiming the same vested amount twice.
+        let sid = client.create_schedule(&funder, &beneficiary, &token, &1000, &0, &0, &100, &VestingType::Linear, &false);
+        env.ledger().with_mut(|l| l.sequence_number = 50);
+        client.claim(&beneficiary, &sid);
+        client.claim(&beneficiary, &sid);
+    }
+
+    #[test]
+    fn test_claim_after_full_vesting_claims_remaining_balance() {
+        let (env, client, funder, beneficiary, token) = setup();
+        // Verifies a later claim receives the remaining balance after a partial claim.
+        let sid = client.create_schedule(&funder, &beneficiary, &token, &1000, &0, &0, &100, &VestingType::Linear, &false);
+        env.ledger().with_mut(|l| l.sequence_number = 50);
+        assert_eq!(client.claim(&beneficiary, &sid), 500);
+
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+        assert_eq!(client.claim(&beneficiary, &sid), 500);
+        assert_eq!(TokenClient::new(&env, &token).balance(&beneficiary), 1000);
+    }
+
+    #[test]
+    #[should_panic(expected = "not revocable")]
+    fn test_revoke_non_revocable_schedule_panics() {
+        let (_env, client, funder, beneficiary, token) = setup();
+        // Verifies irrevocable schedules cannot be revoked by the funder.
+        let sid = client.create_schedule(&funder, &beneficiary, &token, &1000, &0, &0, &100, &VestingType::Linear, &false);
+        client.revoke(&funder, &sid);
+    }
+
+    #[test]
+    fn test_revoke_after_full_vesting_returns_zero_to_funder() {
+        let (env, client, funder, beneficiary, token) = setup();
+        // Verifies no tokens are refunded when the full schedule is already vested.
+        let sid = client.create_schedule(&funder, &beneficiary, &token, &1000, &0, &0, &100, &VestingType::Linear, &true);
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+        client.revoke(&funder, &sid);
+        assert_eq!(TokenClient::new(&env, &token).balance(&funder), 0);
+    }
+
+    #[test]
+    fn test_revoke_before_cliff_returns_full_amount_to_funder() {
+        let (env, client, funder, beneficiary, token) = setup();
+        // Verifies all tokens are refunded when nothing has vested yet.
+        let sid = client.create_schedule(&funder, &beneficiary, &token, &1000, &0, &50, &100, &VestingType::Linear, &true);
+        env.ledger().with_mut(|l| l.sequence_number = 10);
+        client.revoke(&funder, &sid);
+        assert_eq!(TokenClient::new(&env, &token).balance(&funder), 1000);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid range")]
+    fn test_create_schedule_end_before_start_panics() {
+        let (_env, client, funder, beneficiary, token) = setup();
+        // Verifies schedules must end after their start ledger.
+        client.create_schedule(&funder, &beneficiary, &token, &1000, &100, &100, &100, &VestingType::Linear, &false);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid cliff")]
+    fn test_create_schedule_cliff_after_end_panics() {
+        let (_env, client, funder, beneficiary, token) = setup();
+        // Verifies cliff ledgers cannot exceed the end ledger.
+        client.create_schedule(&funder, &beneficiary, &token, &1000, &0, &101, &100, &VestingType::Linear, &false);
     }
 }
