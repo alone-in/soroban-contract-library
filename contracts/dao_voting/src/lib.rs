@@ -2,7 +2,7 @@
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Symbol, Vec};
 
 #[contracttype]
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ProposalStatus {
     Active,
     Passed,
@@ -194,15 +194,15 @@ mod tests {
         Bytes, Env,
     };
 
-    fn setup() -> (Env, DaoVotingContractClient<'static>, Address) {
+    fn setup() -> (Env, DaoVotingContractClient<'static>, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
-        let cid = env.register(DaoVotingContract, ());
+        let cid = env.register_contract(None, DaoVotingContract);
         let client = DaoVotingContractClient::new(&env, &cid);
         let admin = Address::generate(&env);
         // quorum=10%, approval=51%, total_supply=1000
         client.initialize(&admin, &1000, &5100, &1000);
-        (env, client, admin)
+        (env, client, admin, cid)
     }
 
     fn desc(env: &Env) -> Bytes {
@@ -211,7 +211,7 @@ mod tests {
 
     #[test]
     fn test_proposal_passes() {
-        let (env, client, admin) = setup();
+        let (env, client, admin, _contract_id) = setup();
         let voter = Address::generate(&env);
         let pid = client.submit_proposal(&admin, &desc(&env), &100, &None, &None, &0);
 
@@ -225,7 +225,7 @@ mod tests {
 
     #[test]
     fn test_proposal_rejected_quorum() {
-        let (env, client, admin) = setup();
+        let (env, client, admin, _contract_id) = setup();
         let voter = Address::generate(&env);
         let pid = client.submit_proposal(&admin, &desc(&env), &100, &None, &None, &0);
 
@@ -240,10 +240,9 @@ mod tests {
 
     #[test]
     fn test_execute_with_token() {
-        let (env, client, admin) = setup();
+        let (env, client, admin, contract_id) = setup();
         let voter = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let contract_id = env.register(DaoVotingContract, ());
 
         let token_admin = Address::generate(&env);
         let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
@@ -265,7 +264,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "already voted")]
     fn test_double_vote_panics() {
-        let (env, client, admin) = setup();
+        let (env, client, admin, _contract_id) = setup();
         let voter = Address::generate(&env);
         let pid = client.submit_proposal(&admin, &desc(&env), &100, &None, &None, &0);
         env.ledger().with_mut(|l| l.sequence_number = 50);
@@ -275,9 +274,131 @@ mod tests {
 
     #[test]
     fn test_cancel() {
-        let (env, client, admin) = setup();
+        let (env, client, admin, _contract_id) = setup();
         let pid = client.submit_proposal(&admin, &desc(&env), &100, &None, &None, &0);
         client.cancel(&admin, &pid);
         assert_eq!(client.get_proposal(&pid).status, ProposalStatus::Cancelled);
+    }
+
+    #[test]
+    #[should_panic(expected = "voting ended")]
+    fn test_vote_after_end_ledger_panics() {
+        let (env, client, admin, _contract_id) = setup();
+        // Verifies votes are rejected once the proposal voting window has closed.
+        let voter = Address::generate(&env);
+        let pid = client.submit_proposal(&admin, &desc(&env), &100, &None, &None, &0);
+        env.ledger().with_mut(|l| l.sequence_number = 101);
+        client.vote(&voter, &pid, &true, &100);
+    }
+
+    #[test]
+    #[should_panic(expected = "voting not ended")]
+    fn test_finalize_before_end_ledger_panics() {
+        let (env, client, admin, _contract_id) = setup();
+        // Verifies proposals cannot be finalized before the configured end ledger.
+        let pid = client.submit_proposal(&admin, &desc(&env), &100, &None, &None, &0);
+        env.ledger().with_mut(|l| l.sequence_number = 99);
+        client.finalize(&pid);
+    }
+
+    #[test]
+    fn test_finalize_rejects_when_approval_below_threshold() {
+        let (env, client, admin, _contract_id) = setup();
+        // Verifies 40% approval fails against the 51% approval threshold with quorum met.
+        let yes_voter = Address::generate(&env);
+        let no_voter = Address::generate(&env);
+        let pid = client.submit_proposal(&admin, &desc(&env), &100, &None, &None, &0);
+
+        env.ledger().with_mut(|l| l.sequence_number = 50);
+        client.vote(&yes_voter, &pid, &true, &40);
+        client.vote(&no_voter, &pid, &false, &60);
+
+        env.ledger().with_mut(|l| l.sequence_number = 101);
+        client.finalize(&pid);
+        assert_eq!(client.get_proposal(&pid).status, ProposalStatus::Rejected);
+    }
+
+    #[test]
+    fn test_finalize_passes_when_approval_above_threshold() {
+        let (env, client, admin, _contract_id) = setup();
+        // Verifies 60% approval passes against the 51% approval threshold with quorum met.
+        let yes_voter = Address::generate(&env);
+        let no_voter = Address::generate(&env);
+        let pid = client.submit_proposal(&admin, &desc(&env), &100, &None, &None, &0);
+
+        env.ledger().with_mut(|l| l.sequence_number = 50);
+        client.vote(&yes_voter, &pid, &true, &60);
+        client.vote(&no_voter, &pid, &false, &40);
+
+        env.ledger().with_mut(|l| l.sequence_number = 101);
+        client.finalize(&pid);
+        assert_eq!(client.get_proposal(&pid).status, ProposalStatus::Passed);
+    }
+
+    #[test]
+    #[should_panic(expected = "not passed")]
+    fn test_execute_rejected_proposal_panics() {
+        let (env, client, admin, _contract_id) = setup();
+        // Verifies rejected proposals cannot be executed.
+        let voter = Address::generate(&env);
+        let pid = client.submit_proposal(&admin, &desc(&env), &100, &None, &None, &0);
+
+        env.ledger().with_mut(|l| l.sequence_number = 50);
+        client.vote(&voter, &pid, &true, &5);
+
+        env.ledger().with_mut(|l| l.sequence_number = 101);
+        client.finalize(&pid);
+        client.execute(&admin, &pid);
+    }
+
+    #[test]
+    #[should_panic(expected = "not passed")]
+    fn test_execute_already_executed_proposal_panics() {
+        let (env, client, admin, contract_id) = setup();
+        // Verifies execute cannot be called twice on the same passed proposal.
+        let voter = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+        StellarAssetClient::new(&env, &token_id).mint(&contract_id, &500);
+
+        let pid = client.submit_proposal(
+            &admin, &desc(&env), &100,
+            &Some(token_id.clone()), &Some(recipient), &200,
+        );
+
+        env.ledger().with_mut(|l| l.sequence_number = 50);
+        client.vote(&voter, &pid, &true, &600);
+
+        env.ledger().with_mut(|l| l.sequence_number = 101);
+        client.finalize(&pid);
+        client.execute(&admin, &pid);
+        client.execute(&admin, &pid);
+    }
+
+    #[test]
+    #[should_panic(expected = "unauthorized")]
+    fn test_cancel_by_non_admin_panics() {
+        let (env, client, admin, _contract_id) = setup();
+        // Verifies only the configured admin can cancel active proposals.
+        let non_admin = Address::generate(&env);
+        let pid = client.submit_proposal(&admin, &desc(&env), &100, &None, &None, &0);
+        client.cancel(&non_admin, &pid);
+    }
+
+    #[test]
+    #[should_panic(expected = "end_ledger must be future")]
+    fn test_submit_proposal_with_past_end_ledger_panics() {
+        let (env, client, admin, _contract_id) = setup();
+        // Verifies proposal deadlines must be strictly in the future.
+        client.submit_proposal(&admin, &desc(&env), &0, &None, &None, &0);
+    }
+
+    #[test]
+    #[should_panic(expected = "already initialized")]
+    fn test_initialize_twice_panics() {
+        let (_env, client, admin, _contract_id) = setup();
+        // Verifies initialize is a one-time operation.
+        client.initialize(&admin, &1000, &5100, &1000);
     }
 }
