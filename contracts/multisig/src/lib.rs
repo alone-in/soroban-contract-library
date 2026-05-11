@@ -3,44 +3,69 @@ use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Sym
 
 #[contracttype]
 #[derive(Clone, PartialEq)]
+/// Execution state of a multisig transfer proposal.
 pub enum ProposalStatus {
+    /// Proposal is open and can still receive approvals.
     Pending,
+    /// Proposal reached the approval threshold and was executed.
     Executed,
+    /// Proposal was cancelled by its proposer before execution.
     Cancelled,
 }
 
 #[contracttype]
 #[derive(Clone)]
+/// Token transfer request that must be approved by the multisig owners.
 pub struct Proposal {
+    /// Owner that created the proposal.
     pub proposer: Address,
+    /// Recipient address for the token transfer.
     pub to: Address,
+    /// Token contract address to transfer from the multisig contract.
     pub token: Address,
+    /// Token amount to transfer when the proposal executes.
     pub amount: i128,
+    /// Owners that have approved this proposal.
     pub approvals: Vec<Address>,
+    /// Current proposal lifecycle status.
     pub status: ProposalStatus,
+    /// Last ledger sequence at which approvals are accepted.
     pub expiry_ledger: u32,
 }
 
 #[contracttype]
 #[derive(Clone)]
+/// Multisig wallet configuration.
 pub struct Config {
+    /// Addresses that can create, approve, and cancel eligible proposals.
     pub owners: Vec<Address>,
+    /// Number of owner approvals required to execute a proposal.
     pub threshold: u32,
 }
 
 #[contracttype]
+/// Storage keys used by the multisig contract.
 pub enum DataKey {
+    /// Instance-level multisig configuration.
     Config,
+    /// Persistent transfer proposal by numeric id.
     Proposal(u64),
+    /// Instance counter used to assign the next proposal id.
     Counter,
 }
 
 #[contract]
+/// Threshold-based token transfer multisig contract.
 pub struct MultisigContract;
 
 #[contractimpl]
 impl MultisigContract {
     /// Initialize the multisig with owners and approval threshold.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the contract is already initialized or if the threshold is
+    /// zero or greater than the number of owners.
     pub fn initialize(env: Env, owners: Vec<Address>, threshold: u32) {
         assert!(!env.storage().instance().has(&DataKey::Config), "already initialized");
         assert!(threshold as usize <= owners.len() && threshold > 0, "invalid threshold");
@@ -48,6 +73,11 @@ impl MultisigContract {
     }
 
     /// Propose a token transfer. Proposer auto-approves.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the contract is not initialized, the proposer is not an
+    /// owner, or token transfer execution fails when the threshold is one.
     pub fn propose_transfer(
         env: Env,
         proposer: Address,
@@ -87,6 +117,12 @@ impl MultisigContract {
     }
 
     /// Owner approves a pending proposal. Executes if threshold is reached.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the contract is not initialized, the proposal does not exist,
+    /// the signer is not an owner, the proposal is not pending, the proposal is
+    /// expired, the signer already approved it, or execution transfer fails.
     pub fn approve(env: Env, owner: Address, proposal_id: u64) {
         owner.require_auth();
         let config: Config = env.storage().instance().get(&DataKey::Config).unwrap();
@@ -107,6 +143,11 @@ impl MultisigContract {
     }
 
     /// Proposer cancels a pending proposal.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the proposal does not exist, is not pending, or the signer is
+    /// not the proposal creator.
     pub fn cancel(env: Env, proposer: Address, proposal_id: u64) {
         proposer.require_auth();
         let mut proposal: Proposal = env.storage().persistent().get(&DataKey::Proposal(proposal_id)).unwrap();
@@ -134,10 +175,20 @@ impl MultisigContract {
         config.owners.contains(addr)
     }
 
+    /// Returns a transfer proposal by id.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the proposal id does not exist.
     pub fn get_proposal(env: Env, proposal_id: u64) -> Proposal {
         env.storage().persistent().get(&DataKey::Proposal(proposal_id)).unwrap()
     }
 
+    /// Returns the multisig owner set and threshold.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the multisig contract is not initialized.
     pub fn get_config(env: Env) -> Config {
         env.storage().instance().get(&DataKey::Config).unwrap()
     }
