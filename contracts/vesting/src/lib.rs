@@ -83,6 +83,12 @@ impl VestingContract {
         Self::_vested(&env, &s)
     }
 
+    /// Returns the currently vested and unclaimed amount for a schedule.
+    pub fn get_claimable(env: Env, schedule_id: u64) -> i128 {
+        let s: VestingSchedule = env.storage().persistent().get(&DataKey::Schedule(schedule_id)).unwrap();
+        Self::_claimable(&env, &s)
+    }
+
     fn _vested(env: &Env, s: &VestingSchedule) -> i128 {
         if s.revoked {
             return s.claimed;
@@ -104,6 +110,19 @@ impl VestingContract {
         }
     }
 
+    fn _claimable(env: &Env, s: &VestingSchedule) -> i128 {
+        if s.revoked {
+            return 0;
+        }
+
+        let amount = Self::_vested(env, s) - s.claimed;
+        if amount > 0 {
+            amount
+        } else {
+            0
+        }
+    }
+
     /// Beneficiary claims all currently vested but unclaimed tokens.
     pub fn claim(env: Env, beneficiary: Address, schedule_id: u64) -> i128 {
         beneficiary.require_auth();
@@ -112,8 +131,7 @@ impl VestingContract {
         assert!(!s.revoked, "revoked");
         assert!(beneficiary == s.beneficiary, "unauthorized");
 
-        let vested = Self::_vested(&env, &s);
-        let claimable = vested - s.claimed;
+        let claimable = Self::_claimable(&env, &s);
         assert!(claimable > 0, "nothing to claim");
 
         s.claimed += claimable;
@@ -169,7 +187,7 @@ mod tests {
     fn setup() -> (Env, VestingContractClient<'static>, Address, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
-        let id = env.register(VestingContract, ());
+        let id = env.register_contract(None, VestingContract);
         let client = VestingContractClient::new(&env, &id);
 
         let funder = Address::generate(&env);
@@ -225,5 +243,59 @@ mod tests {
         let sid = client.create_schedule(&funder, &beneficiary, &token, &1000, &0, &50, &100, &VestingType::Linear, &false);
         env.ledger().with_mut(|l| l.sequence_number = 10);
         client.claim(&beneficiary, &sid);
+    }
+
+    #[test]
+    fn test_get_claimable_before_cliff_returns_zero() {
+        let (env, client, funder, beneficiary, token) = setup();
+        let sid = client.create_schedule(&funder, &beneficiary, &token, &1000, &0, &50, &100, &VestingType::Linear, &false);
+
+        env.ledger().with_mut(|l| l.sequence_number = 10);
+
+        assert_eq!(client.get_claimable(&sid), 0);
+    }
+
+    #[test]
+    fn test_get_claimable_mid_vesting_returns_unclaimed_amount() {
+        let (env, client, funder, beneficiary, token) = setup();
+        let sid = client.create_schedule(&funder, &beneficiary, &token, &1000, &0, &0, &100, &VestingType::Linear, &false);
+
+        env.ledger().with_mut(|l| l.sequence_number = 50);
+
+        assert_eq!(client.get_claimable(&sid), 500);
+    }
+
+    #[test]
+    fn test_get_claimable_after_full_vesting_returns_total_amount() {
+        let (env, client, funder, beneficiary, token) = setup();
+        let sid = client.create_schedule(&funder, &beneficiary, &token, &1000, &0, &0, &100, &VestingType::Linear, &false);
+
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+
+        assert_eq!(client.get_claimable(&sid), 1000);
+    }
+
+    #[test]
+    fn test_get_claimable_after_partial_claim_returns_remaining_vested_amount() {
+        let (env, client, funder, beneficiary, token) = setup();
+        let sid = client.create_schedule(&funder, &beneficiary, &token, &1000, &0, &0, &100, &VestingType::Linear, &false);
+
+        env.ledger().with_mut(|l| l.sequence_number = 50);
+        assert_eq!(client.claim(&beneficiary, &sid), 500);
+
+        env.ledger().with_mut(|l| l.sequence_number = 75);
+
+        assert_eq!(client.get_claimable(&sid), 250);
+    }
+
+    #[test]
+    fn test_get_claimable_returns_zero_for_revoked_schedule() {
+        let (env, client, funder, beneficiary, token) = setup();
+        let sid = client.create_schedule(&funder, &beneficiary, &token, &1000, &0, &0, &100, &VestingType::Linear, &true);
+
+        env.ledger().with_mut(|l| l.sequence_number = 50);
+        client.revoke(&funder, &sid);
+
+        assert_eq!(client.get_claimable(&sid), 0);
     }
 }
