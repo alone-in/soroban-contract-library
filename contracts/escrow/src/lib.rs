@@ -4,7 +4,7 @@ use soroban_sdk::{
 };
 
 #[contracttype]
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum EscrowStatus {
     Active,
     Completed,
@@ -53,6 +53,7 @@ impl EscrowContract {
         expiry_ledger: u32,
     ) -> u64 {
         depositor.require_auth();
+        assert!(amounts.len() > 0, "no milestones");
 
         let id: u64 = env
             .storage()
@@ -99,7 +100,6 @@ impl EscrowContract {
         let caller_is_depositor = caller == escrow.depositor;
         assert!(caller_is_arbiter || caller_is_depositor, "unauthorized");
 
-        let idx = milestone_index as usize;
         let mut ms = escrow.milestones.get(milestone_index).unwrap();
         assert!(!ms.released, "already released");
 
@@ -201,7 +201,7 @@ mod tests {
     fn setup() -> (Env, EscrowContractClient<'static>, Address, Address, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register(EscrowContract, ());
+        let contract_id = env.register_contract(None, EscrowContract);
         let client = EscrowContractClient::new(&env, &contract_id);
 
         let depositor = Address::generate(&env);
@@ -269,9 +269,113 @@ mod tests {
     #[should_panic(expected = "already released")]
     fn test_double_release_panics() {
         let (_env, client, depositor, beneficiary, arbiter, token) = setup();
-        let amounts = vec![&_env, 1000i128];
+        let amounts = vec![&_env, 500i128, 500i128];
         let id = client.create(&depositor, &beneficiary, &arbiter, &token, &amounts, &9999);
         client.release_milestone(&arbiter, &id, &0);
         client.release_milestone(&arbiter, &id, &0);
+    }
+
+    #[test]
+    #[should_panic(expected = "no milestones")]
+    fn test_create_with_zero_milestones_panics() {
+        let (env, client, depositor, beneficiary, arbiter, token) = setup();
+        // Verifies an escrow must contain at least one releasable milestone.
+        let amounts = vec![&env];
+        client.create(&depositor, &beneficiary, &arbiter, &token, &amounts, &9999);
+    }
+
+    #[test]
+    fn test_create_with_single_milestone() {
+        let (env, client, depositor, beneficiary, arbiter, token) = setup();
+        // Verifies a one-milestone escrow stores the expected amount and remains active.
+        let amounts = vec![&env, 1000i128];
+        let id = client.create(&depositor, &beneficiary, &arbiter, &token, &amounts, &9999);
+        let escrow = client.get_escrow(&id);
+        assert_eq!(escrow.milestones.len(), 1);
+        assert_eq!(escrow.milestones.get(0).unwrap().amount, 1000);
+        assert_eq!(escrow.status, EscrowStatus::Active);
+    }
+
+    #[test]
+    fn test_release_milestone_by_depositor() {
+        let (env, client, depositor, beneficiary, arbiter, token) = setup();
+        // Verifies the depositor, not only the arbiter, can release milestones.
+        let amounts = vec![&env, 1000i128];
+        let id = client.create(&depositor, &beneficiary, &arbiter, &token, &amounts, &9999);
+        client.release_milestone(&depositor, &id, &0);
+        assert_eq!(client.get_escrow(&id).status, EscrowStatus::Completed);
+        assert_eq!(TokenClient::new(&env, &token).balance(&beneficiary), 1000);
+    }
+
+    #[test]
+    fn test_partial_milestone_release_keeps_escrow_active() {
+        let (env, client, depositor, beneficiary, arbiter, token) = setup();
+        // Verifies releasing only some milestones does not complete the escrow.
+        let amounts = vec![&env, 300i128, 700i128];
+        let id = client.create(&depositor, &beneficiary, &arbiter, &token, &amounts, &9999);
+        client.release_milestone(&arbiter, &id, &0);
+        let escrow = client.get_escrow(&id);
+        assert_eq!(escrow.status, EscrowStatus::Active);
+        assert!(escrow.milestones.get(0).unwrap().released);
+        assert!(!escrow.milestones.get(1).unwrap().released);
+    }
+
+    #[test]
+    #[should_panic(expected = "unauthorized")]
+    fn test_raise_dispute_by_non_beneficiary_panics() {
+        let (env, client, depositor, beneficiary, arbiter, token) = setup();
+        // Verifies only the beneficiary can raise a dispute.
+        let stranger = Address::generate(&env);
+        let amounts = vec![&env, 1000i128];
+        let id = client.create(&depositor, &beneficiary, &arbiter, &token, &amounts, &9999);
+        client.raise_dispute(&stranger, &id);
+    }
+
+    #[test]
+    fn test_resolve_dispute_refunds_depositor() {
+        let (env, client, depositor, beneficiary, arbiter, token) = setup();
+        // Verifies a dispute resolved against the beneficiary refunds the depositor.
+        let amounts = vec![&env, 1000i128];
+        let id = client.create(&depositor, &beneficiary, &arbiter, &token, &amounts, &9999);
+        client.raise_dispute(&beneficiary, &id);
+        client.resolve_dispute(&arbiter, &id, &false);
+        assert_eq!(client.get_escrow(&id).status, EscrowStatus::Refunded);
+        assert_eq!(TokenClient::new(&env, &token).balance(&depositor), 1000);
+    }
+
+    #[test]
+    #[should_panic(expected = "not expired")]
+    fn test_reclaim_expired_before_expiry_panics() {
+        let (env, client, depositor, beneficiary, arbiter, token) = setup();
+        // Verifies depositors cannot reclaim while the escrow has not expired.
+        let amounts = vec![&env, 1000i128];
+        let id = client.create(&depositor, &beneficiary, &arbiter, &token, &amounts, &10);
+        env.ledger().with_mut(|l| l.sequence_number = 10);
+        client.reclaim_expired(&depositor, &id);
+    }
+
+    #[test]
+    fn test_reclaim_expired_after_partial_release_refunds_unreleased_amount() {
+        let (env, client, depositor, beneficiary, arbiter, token) = setup();
+        // Verifies only unreleased milestone funds are reclaimed after expiry.
+        let amounts = vec![&env, 300i128, 700i128];
+        let id = client.create(&depositor, &beneficiary, &arbiter, &token, &amounts, &10);
+        client.release_milestone(&arbiter, &id, &0);
+
+        env.ledger().with_mut(|l| l.sequence_number = 11);
+        client.reclaim_expired(&depositor, &id);
+
+        let token_client = TokenClient::new(&env, &token);
+        assert_eq!(client.get_escrow(&id).status, EscrowStatus::Refunded);
+        assert_eq!(token_client.balance(&beneficiary), 300);
+        assert_eq!(token_client.balance(&depositor), 700);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_get_nonexistent_escrow_panics() {
+        let (_env, client, _depositor, _beneficiary, _arbiter, _token) = setup();
+        // Verifies missing escrow IDs do not return fabricated data.
+        client.get_escrow(&999);
     }
 }
