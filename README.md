@@ -51,6 +51,32 @@ cargo test --workspace
 
 ---
 
+## Deploy to Testnet
+
+The repository includes a helper script that builds every contract as release
+WASM and deploys the artifacts to Stellar testnet.
+
+```bash
+# Create or choose a funded testnet identity first
+stellar keys generate alice --network testnet --fund
+
+# Deploy all contracts and print their contract IDs
+./scripts/deploy_testnet.sh alice
+```
+
+You can also provide the source account through the environment:
+
+```bash
+STELLAR_SOURCE_ACCOUNT=alice ./scripts/deploy_testnet.sh
+```
+
+The script fails fast when the Stellar CLI is missing, when the
+`wasm32-unknown-unknown` Rust target is not installed, or when a source account
+is not provided. See [`scripts/README.md`](scripts/README.md) for prerequisites
+and options.
+
+---
+
 ## Project Structure
 
 ```

@@ -2,7 +2,7 @@
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Symbol, Vec};
 
 #[contracttype]
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum ProposalStatus {
     Pending,
     Executed,
@@ -43,7 +43,7 @@ impl MultisigContract {
     /// Initialize the multisig with owners and approval threshold.
     pub fn initialize(env: Env, owners: Vec<Address>, threshold: u32) {
         assert!(!env.storage().instance().has(&DataKey::Config), "already initialized");
-        assert!(threshold as usize <= owners.len() && threshold > 0, "invalid threshold");
+        assert!(threshold <= owners.len() && threshold > 0, "invalid threshold");
         env.storage().instance().set(&DataKey::Config, &Config { owners, threshold });
     }
 
@@ -155,7 +155,7 @@ mod tests {
     fn setup_3of2() -> (Env, MultisigContractClient<'static>, Address, Address, Address, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
-        let cid = env.register(MultisigContract, ());
+        let cid = env.register_contract(None, MultisigContract);
         let client = MultisigContractClient::new(&env, &cid);
 
         let o1 = Address::generate(&env);
