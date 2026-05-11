@@ -4,7 +4,7 @@ use soroban_sdk::{
 };
 
 #[contracttype]
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum EscrowStatus {
     Active,
     Completed,
@@ -16,7 +16,7 @@ pub enum EscrowStatus {
 #[derive(Clone)]
 pub struct Milestone {
     pub amount: i128,
-    pub released: bool,
+    pub released_amount: i128,
 }
 
 #[contracttype]
@@ -65,7 +65,7 @@ impl EscrowContract {
 
         let mut milestones: Vec<Milestone> = Vec::new(&env);
         for amt in amounts.iter() {
-            milestones.push_back(Milestone { amount: amt, released: false });
+            milestones.push_back(Milestone { amount: amt, released_amount: 0 });
         }
 
         let escrow = Escrow {
@@ -90,7 +90,7 @@ impl EscrowContract {
     }
 
     /// Arbiter or depositor releases a specific milestone to beneficiary.
-    pub fn release_milestone(env: Env, caller: Address, escrow_id: u64, milestone_index: u32) {
+    pub fn release_milestone(env: Env, caller: Address, escrow_id: u64, milestone_index: u32, amount: i128) {
         caller.require_auth();
         let mut escrow: Escrow = env.storage().persistent().get(&DataKey::Escrow(escrow_id)).unwrap();
 
@@ -98,22 +98,23 @@ impl EscrowContract {
         let caller_is_arbiter = caller == escrow.arbiter;
         let caller_is_depositor = caller == escrow.depositor;
         assert!(caller_is_arbiter || caller_is_depositor, "unauthorized");
+        assert!(amount > 0, "invalid amount");
 
-        let idx = milestone_index as usize;
         let mut ms = escrow.milestones.get(milestone_index).unwrap();
-        assert!(!ms.released, "already released");
+        let remaining = ms.amount - ms.released_amount;
+        assert!(amount <= remaining, "release exceeds remaining");
 
-        ms.released = true;
+        ms.released_amount += amount;
         escrow.milestones.set(milestone_index, ms.clone());
 
         token::Client::new(&env, &escrow.token).transfer(
             &env.current_contract_address(),
             &escrow.beneficiary,
-            &ms.amount,
+            &amount,
         );
 
         // Mark completed if all milestones released
-        let all_done = escrow.milestones.iter().all(|m| m.released);
+        let all_done = escrow.milestones.iter().all(|m| m.released_amount == m.amount);
         if all_done {
             escrow.status = EscrowStatus::Completed;
         }
@@ -121,7 +122,7 @@ impl EscrowContract {
         env.storage().persistent().set(&DataKey::Escrow(escrow_id), &escrow);
         env.events().publish(
             (Symbol::new(&env, "milestone_released"), escrow_id),
-            (milestone_index, ms.amount),
+            (milestone_index, amount),
         );
     }
 
@@ -146,7 +147,7 @@ impl EscrowContract {
         assert!(escrow.status == EscrowStatus::Disputed, "not disputed");
         assert!(arbiter == escrow.arbiter, "unauthorized");
 
-        let remaining: i128 = escrow.milestones.iter().filter(|m| !m.released).map(|m| m.amount).sum();
+        let remaining: i128 = escrow.milestones.iter().map(|m| m.amount - m.released_amount).sum();
         let recipient = if release_to_beneficiary { escrow.beneficiary.clone() } else { escrow.depositor.clone() };
 
         token::Client::new(&env, &escrow.token).transfer(
@@ -155,7 +156,18 @@ impl EscrowContract {
             &remaining,
         );
 
-        escrow.status = if release_to_beneficiary { EscrowStatus::Completed } else { EscrowStatus::Refunded };
+        if release_to_beneficiary {
+            let mut i = 0;
+            while i < escrow.milestones.len() {
+                let mut milestone = escrow.milestones.get(i).unwrap();
+                milestone.released_amount = milestone.amount;
+                escrow.milestones.set(i, milestone);
+                i += 1;
+            }
+            escrow.status = EscrowStatus::Completed;
+        } else {
+            escrow.status = EscrowStatus::Refunded;
+        }
         env.storage().persistent().set(&DataKey::Escrow(escrow_id), &escrow);
         env.events().publish(
             (Symbol::new(&env, "dispute_resolved"), escrow_id),
@@ -172,7 +184,7 @@ impl EscrowContract {
         assert!(depositor == escrow.depositor, "unauthorized");
         assert!(env.ledger().sequence() > escrow.expiry_ledger, "not expired");
 
-        let remaining: i128 = escrow.milestones.iter().filter(|m| !m.released).map(|m| m.amount).sum();
+        let remaining: i128 = escrow.milestones.iter().map(|m| m.amount - m.released_amount).sum();
         token::Client::new(&env, &escrow.token).transfer(
             &env.current_contract_address(),
             &escrow.depositor,
@@ -201,7 +213,7 @@ mod tests {
     fn setup() -> (Env, EscrowContractClient<'static>, Address, Address, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register(EscrowContract, ());
+        let contract_id = env.register_contract(None, EscrowContract);
         let client = EscrowContractClient::new(&env, &contract_id);
 
         let depositor = Address::generate(&env);
@@ -222,12 +234,12 @@ mod tests {
         let amounts = vec![&env, 300i128, 700i128];
         let id = client.create(&depositor, &beneficiary, &arbiter, &token, &amounts, &9999);
 
-        client.release_milestone(&arbiter, &id, &0);
+        client.release_milestone(&arbiter, &id, &0, &300);
         let escrow = client.get_escrow(&id);
-        assert!(escrow.milestones.get(0).unwrap().released);
+        assert_eq!(escrow.milestones.get(0).unwrap().released_amount, 300);
         assert_eq!(escrow.status, EscrowStatus::Active);
 
-        client.release_milestone(&arbiter, &id, &1);
+        client.release_milestone(&arbiter, &id, &1, &700);
         let escrow = client.get_escrow(&id);
         assert_eq!(escrow.status, EscrowStatus::Completed);
 
@@ -266,12 +278,66 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "already released")]
-    fn test_double_release_panics() {
-        let (_env, client, depositor, beneficiary, arbiter, token) = setup();
-        let amounts = vec![&_env, 1000i128];
+    fn test_partial_then_full_release_same_milestone() {
+        let (env, client, depositor, beneficiary, arbiter, token) = setup();
+        let amounts = vec![&env, 1000i128];
         let id = client.create(&depositor, &beneficiary, &arbiter, &token, &amounts, &9999);
-        client.release_milestone(&arbiter, &id, &0);
-        client.release_milestone(&arbiter, &id, &0);
+
+        client.release_milestone(&arbiter, &id, &0, &400);
+        let escrow = client.get_escrow(&id);
+        assert_eq!(escrow.milestones.get(0).unwrap().released_amount, 400);
+        assert_eq!(escrow.status, EscrowStatus::Active);
+
+        client.release_milestone(&arbiter, &id, &0, &600);
+        let escrow = client.get_escrow(&id);
+        assert_eq!(escrow.milestones.get(0).unwrap().released_amount, 1000);
+        assert_eq!(escrow.status, EscrowStatus::Completed);
+
+        let token_client = TokenClient::new(&env, &token);
+        assert_eq!(token_client.balance(&beneficiary), 1000);
+    }
+
+    #[test]
+    fn test_reclaim_expired_after_partial_release() {
+        let (env, client, depositor, beneficiary, arbiter, token) = setup();
+        let amounts = vec![&env, 1000i128];
+        let id = client.create(&depositor, &beneficiary, &arbiter, &token, &amounts, &10);
+
+        client.release_milestone(&arbiter, &id, &0, &400);
+        env.ledger().with_mut(|l| l.sequence_number = 11);
+        client.reclaim_expired(&depositor, &id);
+
+        let token_client = TokenClient::new(&env, &token);
+        assert_eq!(token_client.balance(&beneficiary), 400);
+        assert_eq!(token_client.balance(&depositor), 600);
+    }
+
+    #[test]
+    fn test_dispute_resolution_after_partial_release() {
+        let (env, client, depositor, beneficiary, arbiter, token) = setup();
+        let amounts = vec![&env, 500i128, 500i128];
+        let id = client.create(&depositor, &beneficiary, &arbiter, &token, &amounts, &9999);
+
+        client.release_milestone(&arbiter, &id, &0, &200);
+        client.raise_dispute(&beneficiary, &id);
+        client.resolve_dispute(&arbiter, &id, &true);
+
+        let escrow = client.get_escrow(&id);
+        assert_eq!(escrow.status, EscrowStatus::Completed);
+        assert_eq!(escrow.milestones.get(0).unwrap().released_amount, 500);
+        assert_eq!(escrow.milestones.get(1).unwrap().released_amount, 500);
+
+        let token_client = TokenClient::new(&env, &token);
+        assert_eq!(token_client.balance(&beneficiary), 1000);
+    }
+
+    #[test]
+    #[should_panic(expected = "release exceeds remaining")]
+    fn test_release_more_than_remaining_panics() {
+        let (_env, client, depositor, beneficiary, arbiter, token) = setup();
+        let amounts = vec![&_env, 500i128, 500i128];
+        let id = client.create(&depositor, &beneficiary, &arbiter, &token, &amounts, &9999);
+        client.release_milestone(&arbiter, &id, &0, &500);
+        client.release_milestone(&arbiter, &id, &0, &1);
     }
 }
