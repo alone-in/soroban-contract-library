@@ -2,7 +2,7 @@
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Symbol, Vec};
 
 #[contracttype]
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ProposalStatus {
     Active,
     Passed,
@@ -31,6 +31,8 @@ pub struct Proposal {
 #[derive(Clone)]
 pub struct Config {
     pub admin: Address,
+    /// Token contract used to read voting power at vote time.
+    pub snapshot_token: Address,
     /// Minimum participation in basis points (e.g. 1000 = 10%)
     pub quorum_bps: u32,
     /// Minimum approval ratio in basis points (e.g. 5100 = 51%)
@@ -51,10 +53,10 @@ pub struct DaoVotingContract;
 
 #[contractimpl]
 impl DaoVotingContract {
-    pub fn initialize(env: Env, admin: Address, quorum_bps: u32, approval_bps: u32, total_supply: i128) {
+    pub fn initialize(env: Env, admin: Address, snapshot_token: Address, quorum_bps: u32, approval_bps: u32, total_supply: i128) {
         assert!(!env.storage().instance().has(&DataKey::Config), "already initialized");
         assert!(quorum_bps <= 10_000 && approval_bps <= 10_000, "bps out of range");
-        env.storage().instance().set(&DataKey::Config, &Config { admin, quorum_bps, approval_bps, total_supply });
+        env.storage().instance().set(&DataKey::Config, &Config { admin, snapshot_token, quorum_bps, approval_bps, total_supply });
     }
 
     /// Submit a governance proposal.
@@ -90,9 +92,13 @@ impl DaoVotingContract {
         id
     }
 
-    /// Cast a vote. voting_power is provided by the caller (token-weighted integration point).
-    pub fn vote(env: Env, voter: Address, proposal_id: u64, support: bool, voting_power: i128) {
+    /// Cast a vote using the configured token balance as voting power.
+    ///
+    /// The balance is read at vote time; this contract does not keep historical snapshots.
+    pub fn vote(env: Env, voter: Address, proposal_id: u64, support: bool) {
         voter.require_auth();
+        let config: Config = env.storage().instance().get(&DataKey::Config).unwrap();
+        let voting_power = token::Client::new(&env, &config.snapshot_token).balance(&voter);
         assert!(voting_power > 0, "zero voting power");
 
         let mut proposal: Proposal = env.storage().persistent().get(&DataKey::Proposal(proposal_id)).unwrap();
@@ -194,15 +200,17 @@ mod tests {
         Bytes, Env,
     };
 
-    fn setup() -> (Env, DaoVotingContractClient<'static>, Address) {
+    fn setup() -> (Env, DaoVotingContractClient<'static>, Address, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
-        let cid = env.register(DaoVotingContract, ());
+        let cid = env.register_contract(None, DaoVotingContract);
         let client = DaoVotingContractClient::new(&env, &cid);
         let admin = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let voting_token = env.register_stellar_asset_contract_v2(token_admin).address();
         // quorum=10%, approval=51%, total_supply=1000
-        client.initialize(&admin, &1000, &5100, &1000);
-        (env, client, admin)
+        client.initialize(&admin, &voting_token, &1000, &5100, &1000);
+        (env, client, admin, cid, voting_token)
     }
 
     fn desc(env: &Env) -> Bytes {
@@ -211,12 +219,13 @@ mod tests {
 
     #[test]
     fn test_proposal_passes() {
-        let (env, client, admin) = setup();
+        let (env, client, admin, _contract_id, voting_token) = setup();
         let voter = Address::generate(&env);
         let pid = client.submit_proposal(&admin, &desc(&env), &100, &None, &None, &0);
+        StellarAssetClient::new(&env, &voting_token).mint(&voter, &600);
 
         env.ledger().with_mut(|l| l.sequence_number = 50);
-        client.vote(&voter, &pid, &true, &600);
+        client.vote(&voter, &pid, &true);
 
         env.ledger().with_mut(|l| l.sequence_number = 101);
         client.finalize(&pid);
@@ -225,13 +234,14 @@ mod tests {
 
     #[test]
     fn test_proposal_rejected_quorum() {
-        let (env, client, admin) = setup();
+        let (env, client, admin, _contract_id, voting_token) = setup();
         let voter = Address::generate(&env);
         let pid = client.submit_proposal(&admin, &desc(&env), &100, &None, &None, &0);
+        StellarAssetClient::new(&env, &voting_token).mint(&voter, &5);
 
         env.ledger().with_mut(|l| l.sequence_number = 50);
-        // Only 5 votes — below 10% quorum of 1000
-        client.vote(&voter, &pid, &true, &5);
+        // Only 5 votes - below 10% quorum of 1000
+        client.vote(&voter, &pid, &true);
 
         env.ledger().with_mut(|l| l.sequence_number = 101);
         client.finalize(&pid);
@@ -240,10 +250,10 @@ mod tests {
 
     #[test]
     fn test_execute_with_token() {
-        let (env, client, admin) = setup();
+        let (env, client, admin, contract_id, voting_token) = setup();
         let voter = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let contract_id = env.register(DaoVotingContract, ());
+        StellarAssetClient::new(&env, &voting_token).mint(&voter, &600);
 
         let token_admin = Address::generate(&env);
         let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
@@ -255,7 +265,7 @@ mod tests {
         );
 
         env.ledger().with_mut(|l| l.sequence_number = 50);
-        client.vote(&voter, &pid, &true, &600);
+        client.vote(&voter, &pid, &true);
         env.ledger().with_mut(|l| l.sequence_number = 101);
         client.finalize(&pid);
         client.execute(&admin, &pid);
@@ -265,17 +275,28 @@ mod tests {
     #[test]
     #[should_panic(expected = "already voted")]
     fn test_double_vote_panics() {
-        let (env, client, admin) = setup();
+        let (env, client, admin, _contract_id, voting_token) = setup();
+        let voter = Address::generate(&env);
+        let pid = client.submit_proposal(&admin, &desc(&env), &100, &None, &None, &0);
+        StellarAssetClient::new(&env, &voting_token).mint(&voter, &100);
+        env.ledger().with_mut(|l| l.sequence_number = 50);
+        client.vote(&voter, &pid, &true);
+        client.vote(&voter, &pid, &false);
+    }
+
+    #[test]
+    #[should_panic(expected = "zero voting power")]
+    fn test_zero_balance_vote_panics() {
+        let (env, client, admin, _contract_id, _voting_token) = setup();
         let voter = Address::generate(&env);
         let pid = client.submit_proposal(&admin, &desc(&env), &100, &None, &None, &0);
         env.ledger().with_mut(|l| l.sequence_number = 50);
-        client.vote(&voter, &pid, &true, &100);
-        client.vote(&voter, &pid, &false, &100);
+        client.vote(&voter, &pid, &true);
     }
 
     #[test]
     fn test_cancel() {
-        let (env, client, admin) = setup();
+        let (env, client, admin, _contract_id, _voting_token) = setup();
         let pid = client.submit_proposal(&admin, &desc(&env), &100, &None, &None, &0);
         client.cancel(&admin, &pid);
         assert_eq!(client.get_proposal(&pid).status, ProposalStatus::Cancelled);
