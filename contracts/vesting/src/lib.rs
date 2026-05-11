@@ -2,7 +2,7 @@
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Symbol};
 
 #[contracttype]
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum VestingType {
     Linear,
     Cliff,
@@ -169,7 +169,7 @@ mod tests {
     fn setup() -> (Env, VestingContractClient<'static>, Address, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
-        let id = env.register(VestingContract, ());
+        let id = env.register_contract(None, VestingContract);
         let client = VestingContractClient::new(&env, &id);
 
         let funder = Address::generate(&env);

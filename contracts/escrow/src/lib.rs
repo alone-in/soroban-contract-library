@@ -4,7 +4,7 @@ use soroban_sdk::{
 };
 
 #[contracttype]
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum EscrowStatus {
     Active,
     Completed,
@@ -99,7 +99,6 @@ impl EscrowContract {
         let caller_is_depositor = caller == escrow.depositor;
         assert!(caller_is_arbiter || caller_is_depositor, "unauthorized");
 
-        let idx = milestone_index as usize;
         let mut ms = escrow.milestones.get(milestone_index).unwrap();
         assert!(!ms.released, "already released");
 
@@ -201,7 +200,7 @@ mod tests {
     fn setup() -> (Env, EscrowContractClient<'static>, Address, Address, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register(EscrowContract, ());
+        let contract_id = env.register_contract(None, EscrowContract);
         let client = EscrowContractClient::new(&env, &contract_id);
 
         let depositor = Address::generate(&env);
@@ -269,7 +268,7 @@ mod tests {
     #[should_panic(expected = "already released")]
     fn test_double_release_panics() {
         let (_env, client, depositor, beneficiary, arbiter, token) = setup();
-        let amounts = vec![&_env, 1000i128];
+        let amounts = vec![&_env, 500i128, 500i128];
         let id = client.create(&depositor, &beneficiary, &arbiter, &token, &amounts, &9999);
         client.release_milestone(&arbiter, &id, &0);
         client.release_milestone(&arbiter, &id, &0);

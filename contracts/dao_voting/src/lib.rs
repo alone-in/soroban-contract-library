@@ -2,7 +2,7 @@
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Symbol, Vec};
 
 #[contracttype]
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum ProposalStatus {
     Active,
     Passed,
@@ -194,15 +194,15 @@ mod tests {
         Bytes, Env,
     };
 
-    fn setup() -> (Env, DaoVotingContractClient<'static>, Address) {
+    fn setup() -> (Env, DaoVotingContractClient<'static>, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
-        let cid = env.register(DaoVotingContract, ());
+        let cid = env.register_contract(None, DaoVotingContract);
         let client = DaoVotingContractClient::new(&env, &cid);
         let admin = Address::generate(&env);
         // quorum=10%, approval=51%, total_supply=1000
         client.initialize(&admin, &1000, &5100, &1000);
-        (env, client, admin)
+        (env, client, admin, cid)
     }
 
     fn desc(env: &Env) -> Bytes {
@@ -211,7 +211,7 @@ mod tests {
 
     #[test]
     fn test_proposal_passes() {
-        let (env, client, admin) = setup();
+        let (env, client, admin, _cid) = setup();
         let voter = Address::generate(&env);
         let pid = client.submit_proposal(&admin, &desc(&env), &100, &None, &None, &0);
 
@@ -225,7 +225,7 @@ mod tests {
 
     #[test]
     fn test_proposal_rejected_quorum() {
-        let (env, client, admin) = setup();
+        let (env, client, admin, _cid) = setup();
         let voter = Address::generate(&env);
         let pid = client.submit_proposal(&admin, &desc(&env), &100, &None, &None, &0);
 
@@ -240,10 +240,9 @@ mod tests {
 
     #[test]
     fn test_execute_with_token() {
-        let (env, client, admin) = setup();
+        let (env, client, admin, contract_id) = setup();
         let voter = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let contract_id = env.register(DaoVotingContract, ());
 
         let token_admin = Address::generate(&env);
         let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
@@ -265,7 +264,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "already voted")]
     fn test_double_vote_panics() {
-        let (env, client, admin) = setup();
+        let (env, client, admin, _cid) = setup();
         let voter = Address::generate(&env);
         let pid = client.submit_proposal(&admin, &desc(&env), &100, &None, &None, &0);
         env.ledger().with_mut(|l| l.sequence_number = 50);
@@ -275,7 +274,7 @@ mod tests {
 
     #[test]
     fn test_cancel() {
-        let (env, client, admin) = setup();
+        let (env, client, admin, _cid) = setup();
         let pid = client.submit_proposal(&admin, &desc(&env), &100, &None, &None, &0);
         client.cancel(&admin, &pid);
         assert_eq!(client.get_proposal(&pid).status, ProposalStatus::Cancelled);
