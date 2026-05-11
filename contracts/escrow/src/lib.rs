@@ -5,44 +5,68 @@ use soroban_sdk::{
 
 #[contracttype]
 #[derive(Clone, PartialEq)]
+/// Lifecycle state of an escrow agreement.
 pub enum EscrowStatus {
+    /// Escrow is funded and can release milestones, enter dispute, or expire.
     Active,
+    /// All remaining funds have been released to the beneficiary.
     Completed,
+    /// Beneficiary has raised a dispute awaiting arbiter resolution.
     Disputed,
+    /// Remaining funds have been returned to the depositor.
     Refunded,
 }
 
 #[contracttype]
 #[derive(Clone)]
+/// One funded escrow milestone.
 pub struct Milestone {
+    /// Token amount locked for this milestone.
     pub amount: i128,
+    /// Whether this milestone has already been released.
     pub released: bool,
 }
 
 #[contracttype]
 #[derive(Clone)]
+/// Stored escrow agreement with participant, token, milestone, and status data.
 pub struct Escrow {
+    /// Account that funded the escrow and can reclaim expired funds.
     pub depositor: Address,
+    /// Account that receives released milestone funds.
     pub beneficiary: Address,
+    /// Neutral account allowed to release milestones or resolve disputes.
     pub arbiter: Address,
+    /// Soroban token contract address holding the escrowed asset.
     pub token: Address,
+    /// Ordered milestone list with per-milestone amount and release state.
     pub milestones: Vec<Milestone>,
+    /// Current escrow lifecycle status.
     pub status: EscrowStatus,
+    /// Ledger sequence after which the depositor can reclaim unreleased funds.
     pub expiry_ledger: u32,
 }
 
 #[contracttype]
+/// Storage keys used by the escrow contract.
 pub enum DataKey {
+    /// Persistent escrow record by numeric id.
     Escrow(u64),
+    /// Instance counter used to assign the next escrow id.
     Counter,
 }
 
 #[contract]
+/// Milestone escrow contract with arbiter release, dispute, and expiry flows.
 pub struct EscrowContract;
 
 #[contractimpl]
 impl EscrowContract {
     /// Create a new escrow. Depositor must have approved token transfers.
+    ///
+    /// # Panics
+    ///
+    /// Panics if token transfer from the depositor to the contract fails.
     pub fn create(
         env: Env,
         depositor: Address,
@@ -90,6 +114,12 @@ impl EscrowContract {
     }
 
     /// Arbiter or depositor releases a specific milestone to beneficiary.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the escrow does not exist, is not active, the caller is not
+    /// the arbiter or depositor, the milestone index is invalid, the milestone
+    /// was already released, or the token transfer fails.
     pub fn release_milestone(env: Env, caller: Address, escrow_id: u64, milestone_index: u32) {
         caller.require_auth();
         let mut escrow: Escrow = env.storage().persistent().get(&DataKey::Escrow(escrow_id)).unwrap();
@@ -126,6 +156,11 @@ impl EscrowContract {
     }
 
     /// Beneficiary raises a dispute.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the escrow does not exist, is not active, or the caller is not
+    /// the escrow beneficiary.
     pub fn raise_dispute(env: Env, beneficiary: Address, escrow_id: u64) {
         beneficiary.require_auth();
         let mut escrow: Escrow = env.storage().persistent().get(&DataKey::Escrow(escrow_id)).unwrap();
@@ -139,6 +174,11 @@ impl EscrowContract {
     }
 
     /// Arbiter resolves dispute: release_to_beneficiary true → pay beneficiary, false → refund depositor.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the escrow does not exist, is not disputed, the caller is not
+    /// the arbiter, or the token transfer fails.
     pub fn resolve_dispute(env: Env, arbiter: Address, escrow_id: u64, release_to_beneficiary: bool) {
         arbiter.require_auth();
         let mut escrow: Escrow = env.storage().persistent().get(&DataKey::Escrow(escrow_id)).unwrap();
@@ -164,6 +204,11 @@ impl EscrowContract {
     }
 
     /// Depositor reclaims funds after expiry.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the escrow does not exist, is not active, the caller is not
+    /// the depositor, the escrow has not expired, or the token transfer fails.
     pub fn reclaim_expired(env: Env, depositor: Address, escrow_id: u64) {
         depositor.require_auth();
         let mut escrow: Escrow = env.storage().persistent().get(&DataKey::Escrow(escrow_id)).unwrap();
@@ -184,6 +229,11 @@ impl EscrowContract {
         env.events().publish((Symbol::new(&env, "escrow_reclaimed"), escrow_id), remaining);
     }
 
+    /// Returns an escrow record by id.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the escrow id does not exist.
     pub fn get_escrow(env: Env, escrow_id: u64) -> Escrow {
         env.storage().persistent().get(&DataKey::Escrow(escrow_id)).unwrap()
     }

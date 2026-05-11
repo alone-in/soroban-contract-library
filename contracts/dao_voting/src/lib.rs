@@ -3,33 +3,51 @@ use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Sym
 
 #[contracttype]
 #[derive(Clone, PartialEq)]
+/// Governance proposal lifecycle state.
 pub enum ProposalStatus {
+    /// Proposal is accepting votes.
     Active,
+    /// Proposal met quorum and approval thresholds.
     Passed,
+    /// Proposal failed quorum or approval thresholds.
     Rejected,
+    /// Proposal action has been executed.
     Executed,
+    /// Proposal was cancelled by the admin before finalization.
     Cancelled,
 }
 
 #[contracttype]
 #[derive(Clone)]
+/// DAO proposal with vote totals and optional token-transfer execution data.
 pub struct Proposal {
+    /// Address that submitted the proposal.
     pub proposer: Address,
+    /// Opaque proposal description bytes supplied by the proposer.
     pub description: soroban_sdk::Bytes,
     /// Optional: token transfer on execution
     pub exec_token: Option<Address>,
+    /// Optional recipient for the execution token transfer.
     pub exec_to: Option<Address>,
+    /// Token amount transferred when the proposal executes.
     pub exec_amount: i128,
+    /// Total voting power cast in favor.
     pub votes_for: i128,
+    /// Total voting power cast against.
     pub votes_against: i128,
+    /// Addresses that have already voted.
     pub voters: Vec<Address>,
+    /// Current proposal lifecycle status.
     pub status: ProposalStatus,
+    /// Last ledger sequence at which votes are accepted.
     pub end_ledger: u32,
 }
 
 #[contracttype]
 #[derive(Clone)]
+/// DAO voting configuration.
 pub struct Config {
+    /// Address allowed to cancel active proposals.
     pub admin: Address,
     /// Minimum participation in basis points (e.g. 1000 = 10%)
     pub quorum_bps: u32,
@@ -40,17 +58,28 @@ pub struct Config {
 }
 
 #[contracttype]
+/// Storage keys used by the DAO voting contract.
 pub enum DataKey {
+    /// Instance-level DAO voting configuration.
     Config,
+    /// Persistent proposal by numeric id.
     Proposal(u64),
+    /// Instance counter used to assign the next proposal id.
     Counter,
 }
 
 #[contract]
+/// Simple DAO voting contract with quorum, approval, and optional execution.
 pub struct DaoVotingContract;
 
 #[contractimpl]
 impl DaoVotingContract {
+    /// Initialize DAO voting thresholds and total voting power supply.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the contract is already initialized or either basis-point
+    /// threshold is greater than 10,000.
     pub fn initialize(env: Env, admin: Address, quorum_bps: u32, approval_bps: u32, total_supply: i128) {
         assert!(!env.storage().instance().has(&DataKey::Config), "already initialized");
         assert!(quorum_bps <= 10_000 && approval_bps <= 10_000, "bps out of range");
@@ -58,6 +87,11 @@ impl DaoVotingContract {
     }
 
     /// Submit a governance proposal.
+    ///
+    /// # Panics
+    ///
+    /// Panics if proposer authorization fails or the end ledger is not in the
+    /// future.
     pub fn submit_proposal(
         env: Env,
         proposer: Address,
@@ -91,6 +125,12 @@ impl DaoVotingContract {
     }
 
     /// Cast a vote. voting_power is provided by the caller (token-weighted integration point).
+    ///
+    /// # Panics
+    ///
+    /// Panics if voter authorization fails, voting power is zero, the proposal
+    /// does not exist, the proposal is not active, voting has ended, or the
+    /// voter has already voted.
     pub fn vote(env: Env, voter: Address, proposal_id: u64, support: bool, voting_power: i128) {
         voter.require_auth();
         assert!(voting_power > 0, "zero voting power");
@@ -112,6 +152,11 @@ impl DaoVotingContract {
     }
 
     /// Finalize a proposal after voting ends. Sets status to Passed or Rejected.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the proposal does not exist, is not active, voting has not
+    /// ended, or the contract is not initialized.
     pub fn finalize(env: Env, proposal_id: u64) {
         let mut proposal: Proposal = env.storage().persistent().get(&DataKey::Proposal(proposal_id)).unwrap();
         assert!(proposal.status == ProposalStatus::Active, "not active");
@@ -142,6 +187,11 @@ impl DaoVotingContract {
     }
 
     /// Execute a passed proposal's on-chain action (optional token transfer).
+    ///
+    /// # Panics
+    ///
+    /// Panics if caller authorization fails, the proposal does not exist, the
+    /// proposal has not passed, or token transfer execution fails.
     pub fn execute(env: Env, caller: Address, proposal_id: u64) {
         caller.require_auth();
         let mut proposal: Proposal = env.storage().persistent().get(&DataKey::Proposal(proposal_id)).unwrap();
@@ -163,6 +213,12 @@ impl DaoVotingContract {
     }
 
     /// Admin cancels an active proposal.
+    ///
+    /// # Panics
+    ///
+    /// Panics if admin authorization fails, the contract is not initialized,
+    /// the signer is not the admin, the proposal does not exist, or the
+    /// proposal is not active.
     pub fn cancel(env: Env, admin: Address, proposal_id: u64) {
         admin.require_auth();
         let config: Config = env.storage().instance().get(&DataKey::Config).unwrap();
@@ -176,10 +232,20 @@ impl DaoVotingContract {
         env.events().publish((Symbol::new(&env, "cancelled"), proposal_id), ());
     }
 
+    /// Returns a proposal by id.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the proposal id does not exist.
     pub fn get_proposal(env: Env, proposal_id: u64) -> Proposal {
         env.storage().persistent().get(&DataKey::Proposal(proposal_id)).unwrap()
     }
 
+    /// Returns the DAO voting configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the DAO voting contract is not initialized.
     pub fn get_config(env: Env) -> Config {
         env.storage().instance().get(&DataKey::Config).unwrap()
     }

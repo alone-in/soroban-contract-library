@@ -3,38 +3,62 @@ use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Sym
 
 #[contracttype]
 #[derive(Clone, PartialEq)]
+/// Vesting curve used to release tokens over time.
 pub enum VestingType {
+    /// Tokens vest proportionally between the start and end ledgers.
     Linear,
+    /// All tokens vest once the cliff ledger is reached.
     Cliff,
 }
 
 #[contracttype]
 #[derive(Clone)]
+/// Token vesting schedule stored by the contract.
 pub struct VestingSchedule {
+    /// Account allowed to claim vested tokens.
     pub beneficiary: Address,
+    /// Token contract address for the vested asset.
     pub token: Address,
+    /// Total number of tokens funded into the schedule.
     pub total_amount: i128,
+    /// Amount already claimed by the beneficiary.
     pub claimed: i128,
+    /// Ledger sequence at which vesting starts.
     pub start_ledger: u32,
+    /// Ledger sequence before which no tokens are claimable.
     pub cliff_ledger: u32,
+    /// Ledger sequence at which the schedule is fully vested.
     pub end_ledger: u32,
+    /// Vesting curve used by this schedule.
     pub vesting_type: VestingType,
+    /// Whether the funder can revoke unvested tokens.
     pub revocable: bool,
+    /// Whether this schedule has been revoked.
     pub revoked: bool,
 }
 
 #[contracttype]
+/// Storage keys used by the vesting contract.
 pub enum DataKey {
+    /// Persistent vesting schedule by numeric id.
     Schedule(u64),
+    /// Instance counter used to assign the next schedule id.
     Counter,
 }
 
 #[contract]
+/// Token vesting contract supporting linear, cliff, and revocable schedules.
 pub struct VestingContract;
 
 #[contractimpl]
 impl VestingContract {
     /// Create a vesting schedule. Funder must have approved token transfer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the end ledger is not after the start ledger, the cliff is
+    /// outside the schedule range, funder authorization fails, or token
+    /// transfer from the funder to the contract fails.
     pub fn create_schedule(
         env: Env,
         funder: Address,
@@ -78,6 +102,10 @@ impl VestingContract {
     }
 
     /// Returns the total vested amount at the current ledger.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the schedule id does not exist.
     pub fn vested_amount(env: Env, schedule_id: u64) -> i128 {
         let s: VestingSchedule = env.storage().persistent().get(&DataKey::Schedule(schedule_id)).unwrap();
         Self::_vested(&env, &s)
@@ -105,6 +133,11 @@ impl VestingContract {
     }
 
     /// Beneficiary claims all currently vested but unclaimed tokens.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the schedule does not exist, is revoked, the signer is not
+    /// the beneficiary, there are no claimable tokens, or token transfer fails.
     pub fn claim(env: Env, beneficiary: Address, schedule_id: u64) -> i128 {
         beneficiary.require_auth();
         let mut s: VestingSchedule = env.storage().persistent().get(&DataKey::Schedule(schedule_id)).unwrap();
@@ -129,6 +162,11 @@ impl VestingContract {
     }
 
     /// Funder revokes a revocable schedule; unvested tokens return to funder.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the schedule does not exist, is not revocable, is already
+    /// revoked, funder authorization fails, or token transfer fails.
     pub fn revoke(env: Env, funder: Address, schedule_id: u64) {
         funder.require_auth();
         let mut s: VestingSchedule = env.storage().persistent().get(&DataKey::Schedule(schedule_id)).unwrap();
@@ -152,6 +190,11 @@ impl VestingContract {
         env.events().publish((Symbol::new(&env, "revoked"), schedule_id), (funder, unvested));
     }
 
+    /// Returns a vesting schedule by id.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the schedule id does not exist.
     pub fn get_schedule(env: Env, schedule_id: u64) -> VestingSchedule {
         env.storage().persistent().get(&DataKey::Schedule(schedule_id)).unwrap()
     }
